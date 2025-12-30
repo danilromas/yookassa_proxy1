@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 8787;
 const {
   YOOKASSA_SHOP_ID,
   YOOKASSA_SECRET_KEY,
-  PUBLIC_RETURN_URL = "http://localhost:5173/#/payment-result",
+  PUBLIC_RETURN_URL = "http://localhost:8080/#/payment-result",
   ALLOWED_ORIGINS = "*",
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
@@ -70,6 +70,24 @@ function formatTelegramMessage(payment) {
   return lines.join("\n");
 }
 
+function formatOrderDraftMessage(body, items) {
+  const lines = [
+    `📝 Новая заявка на оплату`,
+    ``,
+    `Имя: ${body.fullName}`,
+    `Телефон: ${body.phone}`,
+    `Доставка: ${body.deliveryMethod}`,
+    `Адрес: ${body.address}`,
+    ``,
+    `Сумма: ${body.totalPrice} ₽`,
+    ``,
+    `Товары:`,
+    ...items.map((item) => `• ${item.title} — ${item.quantity} шт. × ${item.price} ₽`),
+  ];
+
+  return lines.join("\n");
+}
+
 async function sendTelegramNotification(payment) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     return;
@@ -94,6 +112,40 @@ async function sendTelegramNotification(payment) {
     }
   } catch (error) {
     console.error("Telegram notification error", error);
+  }
+}
+
+async function sendTelegramDraft(body, items) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.warn("⚠️ Telegram not configured in proxy - missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
+    console.log("TELEGRAM_BOT_TOKEN:", TELEGRAM_BOT_TOKEN ? "✅ set" : "❌ missing");
+    console.log("TELEGRAM_CHAT_ID:", TELEGRAM_CHAT_ID ? "✅ set" : "❌ missing");
+    return;
+  }
+
+  const text = formatOrderDraftMessage(body, items);
+  console.log("📤 Sending Telegram draft message, text length:", text.length);
+  
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+      }),
+    });
+
+    if (!response.ok) {
+      const data = await response.json();
+      console.error("❌ Telegram draft send error", response.status, data);
+    } else {
+      console.log("✅ Telegram draft sent successfully");
+    }
+  } catch (error) {
+    console.error("❌ Telegram draft error", error);
   }
 }
 
@@ -134,6 +186,9 @@ app.post("/create-payment", async (req, res) => {
 
     const idempotenceKey = crypto.randomUUID();
     const auth = Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString("base64");
+
+    console.log("📝 Creating payment, sending Telegram draft...");
+    await sendTelegramDraft(body, normalizedItems);
 
     const response = await fetch("https://api.yookassa.ru/v3/payments", {
       method: "POST",
@@ -225,7 +280,8 @@ app.post("/yookassa-webhook", async (req, res) => {
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ YooKassa proxy server is running on port ${PORT}`);
+  console.log(`🌐 Accessible at http://localhost:${PORT} or http://<your-local-ip>:${PORT}`);
 });
 
