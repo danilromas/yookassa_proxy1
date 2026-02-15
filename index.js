@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
+import { sql, rowToProduct, bodyToRow } from "./products-db.js";
 
 const app = express();
 const PORT = process.env.PORT || 8787;
@@ -257,6 +258,128 @@ app.post("/create-payment", async (req, res) => {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+// --- API товаров (Neon) для каталога и админки ---
+app.get("/api/products", async (_req, res) => {
+  if (!sql) {
+    return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+  try {
+    const rows = await sql`
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      FROM products
+      ORDER BY created_at DESC NULLS LAST
+    `;
+    const products = rows.map(rowToProduct);
+    return res.json(products);
+  } catch (err) {
+    console.error("Products GET error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+
+app.post("/api/products", async (req, res) => {
+  if (!sql) {
+    return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+  try {
+    const row = bodyToRow(req.body || {});
+    const id = crypto.randomUUID();
+    await sql`
+      INSERT INTO products (id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable)
+      VALUES (${id}, ${row.title}, ${row.price}, ${row.description}, ${row.image}, ${row.full_description}, ${row.in_stock}, ${row.category}, ${row.is_glass}, ${row.is_unbreakable})
+    `;
+    const [inserted] = await sql`
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      FROM products WHERE id = ${id}
+    `;
+    return res.status(201).json(rowToProduct(inserted));
+  } catch (err) {
+    console.error("Products POST error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+
+app.get("/api/products/:id", async (req, res) => {
+  if (!sql) {
+    return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+  try {
+    const { id } = req.params;
+    const rows = await sql`
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      FROM products WHERE id = ${id}
+    `;
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: "Product not found" });
+    return res.json(rowToProduct(row));
+  } catch (err) {
+    console.error("Product GET error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+
+app.patch("/api/products/:id", async (req, res) => {
+  if (!sql) {
+    return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+  try {
+    const { id } = req.params;
+    const [existing] = await sql`
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      FROM products WHERE id = ${id}
+    `;
+    if (!existing) return res.status(404).json({ error: "Product not found" });
+    const currentBody = {
+      title: existing.title,
+      price: existing.price,
+      description: existing.description,
+      image: existing.image,
+      fullDescription: existing.full_description ?? "",
+      inStock: existing.in_stock,
+      category: existing.category ?? "",
+      isGlass: existing.is_glass ?? false,
+      isUnbreakable: existing.is_unbreakable ?? false,
+    };
+    const row = bodyToRow({ ...currentBody, ...(req.body || {}) });
+    await sql`
+      UPDATE products SET
+        title = ${row.title},
+        price = ${row.price},
+        description = ${row.description},
+        image = ${row.image},
+        full_description = ${row.full_description},
+        in_stock = ${row.in_stock},
+        category = ${row.category},
+        is_glass = ${row.is_glass},
+        is_unbreakable = ${row.is_unbreakable}
+      WHERE id = ${id}
+    `;
+    const [updated] = await sql`
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      FROM products WHERE id = ${id}
+    `;
+    return res.json(rowToProduct(updated));
+  } catch (err) {
+    console.error("Product PATCH error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+
+app.delete("/api/products/:id", async (req, res) => {
+  if (!sql) {
+    return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+  try {
+    const { id } = req.params;
+    const deleted = await sql`DELETE FROM products WHERE id = ${id} RETURNING id`;
+    if (!deleted?.length) return res.status(404).json({ error: "Product not found" });
+    return res.status(204).end();
+  } catch (err) {
+    console.error("Product DELETE error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
 });
 
 app.post("/yookassa-webhook", async (req, res) => {
