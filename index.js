@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
+import nodemailer from "nodemailer";
 import { sql, rowToProduct, bodyToRow } from "./products-db.js";
 
 const app = express();
@@ -11,9 +12,16 @@ const {
   YOOKASSA_SHOP_ID,
   YOOKASSA_SECRET_KEY,
   PUBLIC_RETURN_URL = "http://localhost:8080/#/payment-result",
+  PUBLIC_SITE_URL = "http://localhost:5173",
+  PUBLIC_API_URL,
   ALLOWED_ORIGINS = "*",
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
+  SMTP_HOST,
+  SMTP_PORT = "587",
+  SMTP_USER,
+  SMTP_PASS,
+  SMTP_FROM,
 } = process.env;
 
 if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
@@ -40,6 +48,110 @@ app.use(express.json());
 const requiredFields = ["fullName", "phone", "totalPrice", "items"];
 
 const expectedWebhookAuth = `Basic ${Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString("base64")}`;
+
+function createMailer() {
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !SMTP_FROM) {
+    return null;
+  }
+
+  const port = Number(SMTP_PORT) || 587;
+  const secure = port === 465;
+
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port,
+    secure,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  });
+}
+
+const mailer = createMailer();
+
+function normalizeEmail(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function isValidEmail(email) {
+  // Базовая проверка, чтобы отсечь очевидно плохие значения.
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function productUrl(productId) {
+  return `${String(PUBLIC_SITE_URL).replace(/\/$/, "")}/#/product/${productId}`;
+}
+
+function unsubscribeUrl(token) {
+  const base = String(PUBLIC_API_URL || PUBLIC_SITE_URL).replace(/\/$/, "");
+  return `${base}/api/product-watch/unsubscribe/${encodeURIComponent(token)}`;
+}
+
+async function notifyWatchersInStock(product) {
+  if (!sql) return { ok: false, reason: "db_not_configured" };
+  if (!mailer) return { ok: false, reason: "smtp_not_configured" };
+
+  const rows = await sql`
+    SELECT id, email, unsub_token
+    FROM product_watch_subscriptions
+    WHERE product_id = ${product.id}
+      AND active = true
+      AND notified_at IS NULL
+    ORDER BY created_at ASC
+  `;
+
+  if (!rows?.length) {
+    return { ok: true, sent: 0 };
+  }
+
+  let sent = 0;
+  for (const row of rows) {
+    const to = row.email;
+    const link = productUrl(product.id);
+    const unsub = unsubscribeUrl(row.unsub_token);
+
+    try {
+      await mailer.sendMail({
+        from: SMTP_FROM,
+        to,
+        subject: `Товар снова в наличии: ${product.title}`,
+        text: [
+          `Здравствуйте!`,
+          ``,
+          `Товар снова в наличии: ${product.title}`,
+          `Ссылка: ${link}`,
+          ``,
+          `Если вы больше не хотите получать уведомления: ${unsub}`,
+        ].join("\n"),
+        html: `
+          <div style="font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; line-height: 1.5">
+            <h2 style="margin: 0 0 12px">Товар снова в наличии</h2>
+            <p style="margin: 0 0 10px"><strong>${product.title}</strong></p>
+            <p style="margin: 0 0 14px">
+              <a href="${link}">Открыть товар на сайте</a>
+            </p>
+            <p style="margin: 18px 0 0; font-size: 12px; color: #6b7280">
+              Не хотите получать уведомления по этому товару?
+              <a href="${unsub}">Отписаться</a>
+            </p>
+          </div>
+        `.trim(),
+      });
+
+      await sql`
+        UPDATE product_watch_subscriptions
+        SET notified_at = now(), active = false
+        WHERE id = ${row.id}
+      `;
+      sent += 1;
+    } catch (error) {
+      console.error("Email send error:", error);
+    }
+  }
+
+  return { ok: true, sent };
+}
 
 function formatTelegramMessage(payment) {
   const metadataRaw = payment?.metadata?.items ? payment.metadata.items : "[]";
@@ -261,13 +373,115 @@ app.get("/health", (_req, res) => {
 });
 
 // --- API товаров (Neon) для каталога и админки ---
+app.get("/api/product-watch/list", async (_req, res) => {
+  if (!sql) {
+    return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+
+  try {
+    const rows = await sql`
+      SELECT
+        p.id AS product_id,
+        p.title,
+        array_agg(DISTINCT s.email ORDER BY s.email) AS emails,
+        count(DISTINCT s.email) AS total,
+        max(s.created_at) AS last_subscribed_at
+      FROM product_watch_subscriptions s
+      JOIN products p ON p.id = s.product_id
+      WHERE s.active = true
+      GROUP BY p.id, p.title
+      ORDER BY p.title ASC
+    `;
+
+    const result = rows.map((row) => ({
+      productId: row.product_id,
+      title: row.title,
+      emails: row.emails || [],
+      total: Number(row.total) || 0,
+      lastSubscribedAt: row.last_subscribed_at || null,
+    }));
+
+    return res.json(result);
+  } catch (err) {
+    console.error("Product watch list error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+
+app.post("/api/product-watch/subscribe", async (req, res) => {
+  if (!sql) {
+    return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+
+  try {
+    const productId = String(req.body?.productId ?? "").trim();
+    const email = normalizeEmail(req.body?.email);
+
+    if (!productId) {
+      return res.status(400).json({ error: "Missing productId" });
+    }
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email" });
+    }
+
+    const [product] = await sql`SELECT id FROM products WHERE id = ${productId}`;
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const token = crypto.randomUUID();
+    const [subscription] = await sql`
+      INSERT INTO product_watch_subscriptions (product_id, email, unsub_token, active, notified_at)
+      VALUES (${productId}, ${email}, ${token}, true, NULL)
+      ON CONFLICT (product_id, email)
+      DO UPDATE SET active = true, notified_at = NULL
+      RETURNING id, product_id, email, active, created_at, notified_at
+    `;
+
+    return res.json({ ok: true, subscription });
+  } catch (err) {
+    console.error("Subscribe error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+
+app.get("/api/product-watch/unsubscribe/:token", async (req, res) => {
+  if (!sql) {
+    return res.status(503).send("Database not configured");
+  }
+  try {
+    const token = String(req.params.token ?? "").trim();
+    if (!token) return res.status(400).send("Missing token");
+
+    const updated = await sql`
+      UPDATE product_watch_subscriptions
+      SET active = false
+      WHERE unsub_token = ${token}
+      RETURNING id
+    `;
+
+    if (!updated?.length) {
+      return res.status(404).send("Subscription not found");
+    }
+
+    return res
+      .status(200)
+      .send(
+        `<!doctype html><meta charset="utf-8"><title>Отписка</title><div style="font-family:system-ui,Segoe UI,Roboto,Arial;padding:24px">Вы отписались от уведомлений по этому товару.</div>`
+      );
+  } catch (err) {
+    console.error("Unsubscribe error:", err);
+    return res.status(500).send("Internal error");
+  }
+});
+
 app.get("/api/products", async (_req, res) => {
   if (!sql) {
     return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
   }
   try {
     const rows = await sql`
-      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at, updated_at
       FROM products
       ORDER BY created_at DESC NULLS LAST
     `;
@@ -287,11 +501,11 @@ app.post("/api/products", async (req, res) => {
     const row = bodyToRow(req.body || {});
     const id = crypto.randomUUID();
     await sql`
-      INSERT INTO products (id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable)
-      VALUES (${id}, ${row.title}, ${row.price}, ${row.description}, ${row.image}, ${row.full_description}, ${row.in_stock}, ${row.category}, ${row.is_glass}, ${row.is_unbreakable})
+      INSERT INTO products (id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, updated_at)
+      VALUES (${id}, ${row.title}, ${row.price}, ${row.description}, ${row.image}, ${row.full_description}, ${row.in_stock}, ${row.category}, ${row.is_glass}, ${row.is_unbreakable}, now())
     `;
     const [inserted] = await sql`
-      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at, updated_at
       FROM products WHERE id = ${id}
     `;
     return res.status(201).json(rowToProduct(inserted));
@@ -308,7 +522,7 @@ app.get("/api/products/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const rows = await sql`
-      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at, updated_at
       FROM products WHERE id = ${id}
     `;
     const row = rows[0];
@@ -327,7 +541,7 @@ app.patch("/api/products/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const [existing] = await sql`
-      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at, updated_at
       FROM products WHERE id = ${id}
     `;
     if (!existing) return res.status(404).json({ error: "Product not found" });
@@ -353,13 +567,22 @@ app.patch("/api/products/:id", async (req, res) => {
         in_stock = ${row.in_stock},
         category = ${row.category},
         is_glass = ${row.is_glass},
-        is_unbreakable = ${row.is_unbreakable}
+        is_unbreakable = ${row.is_unbreakable},
+        updated_at = now()
       WHERE id = ${id}
     `;
     const [updated] = await sql`
-      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at
+      SELECT id, title, price, description, image, full_description, in_stock, category, is_glass, is_unbreakable, created_at, updated_at
       FROM products WHERE id = ${id}
     `;
+
+    // Авто-уведомления: если было "нет в наличии", а стало "в наличии"
+    if (existing.in_stock === false && updated?.in_stock === true) {
+      notifyWatchersInStock({ id: updated.id, title: updated.title }).catch((err) => {
+        console.error("notifyWatchersInStock error:", err);
+      });
+    }
+
     return res.json(rowToProduct(updated));
   } catch (err) {
     console.error("Product PATCH error:", err);
