@@ -262,6 +262,28 @@ async function sendTelegramDraft(body, items) {
   }
 }
 
+async function sendTelegramToChat(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+      }),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => null);
+      console.error("Telegram sendMessage (chat) error", response.status, data);
+    }
+  } catch (error) {
+    console.error("Telegram sendMessage (chat) exception", error);
+  }
+}
+
 app.post("/create-payment", async (req, res) => {
   try {
     if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
@@ -372,6 +394,42 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+// Webhook для Telegram-бота: команда /start связывает username с chat_id
+app.post("/telegram-bot-webhook", async (req, res) => {
+  try {
+    const update = req.body || {};
+    const message = update.message;
+    const text = message?.text;
+    const from = message?.from;
+    const chat = message?.chat;
+
+    if (text && typeof text === "string" && text.startsWith("/start") && from && chat && sql) {
+      const usernameRaw = from.username ? String(from.username) : "";
+      const usernameNorm = usernameRaw.trim().toLowerCase();
+      const chatId = chat.id;
+
+      if (usernameNorm && chatId) {
+        await sql`
+          UPDATE product_watch_subscriptions
+          SET telegram_chat_id = ${chatId}
+          WHERE telegram IS NOT NULL
+            AND LOWER(REPLACE(telegram, '@', '')) = ${usernameNorm}
+        `;
+
+        await sendTelegramToChat(
+          chatId,
+          "Спасибо! Мы связали ваш Telegram с подписками на сайте. Когда выбранные игрушки появятся в наличии, вы получите сообщение здесь."
+        );
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Telegram webhook error:", err);
+    return res.json({ ok: false });
+  }
+});
+
 // --- API товаров (Neon) для каталога и админки ---
 app.get("/api/product-watch/list", async (_req, res) => {
   if (!sql) {
@@ -384,6 +442,7 @@ app.get("/api/product-watch/list", async (_req, res) => {
         p.id AS product_id,
         p.title,
         array_agg(DISTINCT s.email ORDER BY s.email) AS emails,
+        array_agg(DISTINCT s.telegram ORDER BY s.telegram) FILTER (WHERE s.telegram IS NOT NULL AND s.telegram <> '') AS telegrams,
         count(DISTINCT s.email) AS total,
         max(s.created_at) AS last_subscribed_at
       FROM product_watch_subscriptions s
@@ -397,6 +456,7 @@ app.get("/api/product-watch/list", async (_req, res) => {
       productId: row.product_id,
       title: row.title,
       emails: row.emails || [],
+      telegrams: row.telegrams || [],
       total: Number(row.total) || 0,
       lastSubscribedAt: row.last_subscribed_at || null,
     }));
@@ -416,6 +476,7 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
   try {
     const productId = String(req.body?.productId ?? "").trim();
     const email = normalizeEmail(req.body?.email);
+    const telegram = req.body?.telegram ? String(req.body.telegram).trim() : null;
 
     if (!productId) {
       return res.status(400).json({ error: "Missing productId" });
@@ -431,16 +492,74 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
 
     const token = crypto.randomUUID();
     const [subscription] = await sql`
-      INSERT INTO product_watch_subscriptions (product_id, email, unsub_token, active, notified_at)
-      VALUES (${productId}, ${email}, ${token}, true, NULL)
+      INSERT INTO product_watch_subscriptions (product_id, email, telegram, unsub_token, active, notified_at)
+      VALUES (${productId}, ${email}, ${telegram}, ${token}, true, NULL)
       ON CONFLICT (product_id, email)
-      DO UPDATE SET active = true, notified_at = NULL
-      RETURNING id, product_id, email, active, created_at, notified_at
+      DO UPDATE SET
+        active = true,
+        notified_at = NULL,
+        telegram = COALESCE(EXCLUDED.telegram, product_watch_subscriptions.telegram)
+      RETURNING id, product_id, email, telegram, telegram_chat_id, active, created_at, notified_at
     `;
 
     return res.json({ ok: true, subscription });
   } catch (err) {
     console.error("Subscribe error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+
+// Рассылка в Telegram всем chat_id, привязанным к подпискам по товару
+app.post("/api/product-watch/notify-telegram", async (req, res) => {
+  if (!sql) {
+    return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+  if (!TELEGRAM_BOT_TOKEN) {
+    return res.status(503).json({ error: "Telegram bot is not configured" });
+  }
+
+  try {
+    const productId = String(req.body?.productId ?? "").trim();
+    const customText = req.body?.text ? String(req.body.text) : null;
+
+    if (!productId) {
+      return res.status(400).json({ error: "Missing productId" });
+    }
+
+    const [product] = await sql`
+      SELECT id, title
+      FROM products
+      WHERE id = ${productId}
+    `;
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const rows = await sql`
+      SELECT DISTINCT telegram_chat_id
+      FROM product_watch_subscriptions
+      WHERE product_id = ${productId}
+        AND active = true
+        AND telegram_chat_id IS NOT NULL
+    `;
+
+    const chatIds = rows.map((r) => r.telegram_chat_id).filter(Boolean);
+    if (!chatIds.length) {
+      return res.status(200).json({ ok: true, sent: 0 });
+    }
+
+    const defaultText = `Здравствуйте! Это магазин «Antik Childhood Magic».\nТовар «${product.title}», на который вы подписывались, снова в наличии.\n\nЕсли он актуален, напишите нам в ответ или оформите заказ на сайте.`;
+    const text = customText && customText.trim().length > 0 ? customText : defaultText;
+
+    let sent = 0;
+    for (const chatId of chatIds) {
+      await sendTelegramToChat(chatId, text);
+      sent += 1;
+    }
+
+    return res.json({ ok: true, sent });
+  } catch (err) {
+    console.error("notify-telegram error:", err);
     return res.status(500).json({ error: err.message || "Internal error" });
   }
 });
