@@ -17,6 +17,8 @@ const {
   ALLOWED_ORIGINS = "*",
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
+  SUBSCRIBE_CONFIRM_URL,
+  SUBSCRIBE_CONFIRM_SECRET,
   SMTP_HOST,
   SMTP_PORT = "587",
   SMTP_USER,
@@ -501,6 +503,29 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
         telegram = COALESCE(EXCLUDED.telegram, product_watch_subscriptions.telegram)
       RETURNING id, product_id, email, telegram, telegram_chat_id, active, created_at, notified_at
     `;
+
+    // Отправляем пользователю письмо-подтверждение подписки через PHP-скрипт на фронтенд-хостинге,
+    // чтобы использовать его встроенный mail() без внешних SMTP-сервисов.
+    if (SUBSCRIBE_CONFIRM_URL && SUBSCRIBE_CONFIRM_SECRET) {
+      const params = new URLSearchParams({
+        secret: SUBSCRIBE_CONFIRM_SECRET,
+        email,
+        product_title: product.title,
+        product_id: productId,
+      });
+
+      fetch(SUBSCRIBE_CONFIRM_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: params.toString(),
+      }).catch((err) => {
+        console.error("Subscribe confirmation email error:", err);
+      });
+    } else {
+      console.warn("SUBSCRIBE_CONFIRM_URL or SUBSCRIBE_CONFIRM_SECRET is not set, skip subscribe email");
+    }
 
     return res.json({ ok: true, subscription });
   } catch (err) {
