@@ -477,6 +477,7 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
 
   try {
     const productId = String(req.body?.productId ?? "").trim();
+    const bodyProductTitle = req.body?.productTitle ? String(req.body.productTitle).trim() : "";
     const email = normalizeEmail(req.body?.email);
     const telegram = req.body?.telegram ? String(req.body.telegram).trim() : null;
 
@@ -487,7 +488,11 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
       return res.status(400).json({ error: "Invalid email" });
     }
 
-    const [product] = await sql`SELECT id FROM products WHERE id = ${productId}`;
+    const [product] = await sql`
+      SELECT id, title
+      FROM products
+      WHERE id = ${productId}
+    `;
     if (!product) {
       return res.status(404).json({ error: "Product not found" });
     }
@@ -504,13 +509,15 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
       RETURNING id, product_id, email, telegram, telegram_chat_id, active, created_at, notified_at
     `;
 
-    // Отправляем пользователю письмо-подтверждение подписки через PHP-скрипт на фронтенд-хостинге,
-    // чтобы использовать его встроенный mail() без внешних SMTP-сервисов.
+    // Письмо-подтверждение подписки отправляем через PHP-скрипт на хостинге.
     if (SUBSCRIBE_CONFIRM_URL && SUBSCRIBE_CONFIRM_SECRET) {
+      // Берём название товара из тела запроса (фронтенд) с запасным вариантом из БД.
+      const productTitle = bodyProductTitle || product.title || "товар";
+
       const params = new URLSearchParams({
         secret: SUBSCRIBE_CONFIRM_SECRET,
         email,
-        product_title: product.title,
+        product_title: productTitle,
         product_id: productId,
       });
 
@@ -524,7 +531,7 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
         console.error("Subscribe confirmation email error:", err);
       });
     } else {
-      console.warn("SUBSCRIBE_CONFIRM_URL or SUBSCRIBE_CONFIRM_SECRET is not set, skip subscribe email");
+      console.warn("SUBSCRIBE_CONFIRM_URL or SUBSCRIBE_CONFIRM_SECRET is not set, skip subscribe confirmation email");
     }
 
     return res.json({ ok: true, subscription });
