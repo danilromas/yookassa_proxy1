@@ -82,7 +82,7 @@ function isValidEmail(email) {
 }
 
 function productUrl(productId) {
-  return `${String(PUBLIC_SITE_URL).replace(/\/$/, "")}/#/product/${productId}`;
+  return `https://antikdetstvo.ru/#/product/${productId}`;
 }
 
 function unsubscribeUrl(token) {
