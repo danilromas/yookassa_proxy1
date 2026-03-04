@@ -92,7 +92,6 @@ function unsubscribeUrl(token) {
 
 async function notifyWatchersInStock(product) {
   if (!sql) return { ok: false, reason: "db_not_configured" };
-  if (!mailer) return { ok: false, reason: "smtp_not_configured" };
 
   const rows = await sql`
     SELECT id, email, unsub_token
@@ -114,32 +113,56 @@ async function notifyWatchersInStock(product) {
     const unsub = unsubscribeUrl(row.unsub_token);
 
     try {
-      await mailer.sendMail({
-        from: SMTP_FROM,
-        to,
-        subject: `Товар снова в наличии: ${product.title}`,
-        text: [
-          `Здравствуйте!`,
-          ``,
-          `Товар снова в наличии: ${product.title}`,
-          `Ссылка: ${link}`,
-          ``,
-          `Если вы больше не хотите получать уведомления: ${unsub}`,
-        ].join("\n"),
-        html: `
-          <div style="font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; line-height: 1.5">
-            <h2 style="margin: 0 0 12px">Товар снова в наличии</h2>
-            <p style="margin: 0 0 10px"><strong>${product.title}</strong></p>
-            <p style="margin: 0 0 14px">
-              <a href="${link}">Открыть товар на сайте</a>
-            </p>
-            <p style="margin: 18px 0 0; font-size: 12px; color: #6b7280">
-              Не хотите получать уведомления по этому товару?
-              <a href="${unsub}">Отписаться</a>
-            </p>
-          </div>
-        `.trim(),
-      });
+      // 1) Пытаемся отправить через PHP-скрипт (как и письмо о подписке).
+      if (SUBSCRIBE_CONFIRM_URL && SUBSCRIBE_CONFIRM_SECRET) {
+        const params = new URLSearchParams({
+          secret: SUBSCRIBE_CONFIRM_SECRET,
+          email: to,
+          product_title: product.title,
+          product_id: product.id,
+          type: "restocked",
+          product_url: link,
+        });
+
+        await fetch(SUBSCRIBE_CONFIRM_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: params.toString(),
+        });
+      } else if (mailer) {
+        // 2) Fallback: если нет PHP-скрипта, но есть SMTP, используем nodemailer.
+        await mailer.sendMail({
+          from: SMTP_FROM,
+          to,
+          subject: `Товар снова в наличии: ${product.title}`,
+          text: [
+            `Здравствуйте!`,
+            ``,
+            `Товар снова в наличии: ${product.title}`,
+            `Ссылка: ${link}`,
+            ``,
+            `Если вы больше не хотите получать уведомления: ${unsub}`,
+          ].join("\n"),
+          html: `
+            <div style="font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; line-height: 1.5">
+              <h2 style="margin: 0 0 12px">Товар снова в наличии</h2>
+              <p style="margin: 0 0 10px"><strong>${product.title}</strong></p>
+              <p style="margin: 0 0 14px">
+                <a href="${link}">Открыть товар на сайте</a>
+              </p>
+              <p style="margin: 18px 0 0; font-size: 12px; color: #6b7280">
+                Не хотите получать уведомления по этому товару?
+                <a href="${unsub}">Отписаться</a>
+              </p>
+            </div>
+          `.trim(),
+        });
+      } else {
+        console.warn("No PHP URL or SMTP configured for back-in-stock notifications");
+        continue;
+      }
 
       await sql`
         UPDATE product_watch_subscriptions
