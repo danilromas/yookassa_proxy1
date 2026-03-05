@@ -202,7 +202,16 @@ function formatTelegramMessage(payment) {
     `ID платежа: ${payment?.id ?? "—"}`,
     ``,
     `Товары:`,
-    ...items.map((item) => `• ${item.title ?? item.id} — ${item.quantity} шт. × ${item.price} ₽`),
+    ...items.map((item) => {
+      const material =
+        item.material === "glass"
+          ? "стеклянная"
+          : item.material === "unbreakable"
+          ? "небьющаяся"
+          : null;
+      const materialPart = material ? ` (${material})` : "";
+      return `• ${item.title ?? item.id}${materialPart} — ${item.quantity} шт. × ${item.price} ₽`;
+    }),
   ];
 
   return lines.join("\n");
@@ -220,7 +229,16 @@ function formatOrderDraftMessage(body, items) {
     `Сумма: ${body.totalPrice} ₽`,
     ``,
     `Товары:`,
-    ...items.map((item) => `• ${item.title} — ${item.quantity} шт. × ${item.price} ₽`),
+    ...items.map((item) => {
+      const material =
+        item.material === "glass"
+          ? "стеклянная"
+          : item.material === "unbreakable"
+          ? "небьющаяся"
+          : null;
+      const materialPart = material ? ` (${material})` : "";
+      return `• ${item.title}${materialPart} — ${item.quantity} шт. × ${item.price} ₽`;
+    }),
   ];
 
   return lines.join("\n");
@@ -336,11 +354,19 @@ app.post("/create-payment", async (req, res) => {
       const product = item.product ?? {};
       const quantity = Number(item.quantity) || 1;
       const unitPrice = Number(product.price) || 0;
+      const materialRaw = item.materialChoice ?? null;
+      const material =
+        materialRaw === "glass"
+          ? "glass"
+          : materialRaw === "unbreakable"
+          ? "unbreakable"
+          : null;
       return {
         id: product.id ?? `item-${index + 1}`,
         title: product.title ?? `Товар ${index + 1}`,
         quantity,
         price: unitPrice,
+        material,
       };
     });
 
@@ -380,7 +406,7 @@ app.post("/create-payment", async (req, res) => {
             phone: body.phone.startsWith("+") ? body.phone : `+${body.phone}`,
           },
           items: normalizedItems.map((item) => ({
-            description: item.title.substring(0, 128),
+            description: `${item.title}${item.material === "glass" ? " (стеклянная)" : item.material === "unbreakable" ? " (небьющаяся)" : ""}`.substring(0, 128),
             quantity: item.quantity,
             amount: {
               value: (item.price).toFixed(2),
