@@ -3,6 +3,8 @@ import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import nodemailer from "nodemailer";
+import multer from "multer";
+import { createClient } from "@supabase/supabase-js";
 import { sql, rowToProduct, bodyToRow } from "./products-db.js";
 
 const app = express();
@@ -24,7 +26,79 @@ const {
   SMTP_USER,
   SMTP_PASS,
   SMTP_FROM,
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  UPLOAD_SECRET,
+  PRODUCT_IMAGES_BUCKET = "product-images",
+  ADMIN_API_SECRET,
 } = process.env;
+
+const DEFAULT_ORIGINS =
+  "http://localhost:8080,http://localhost:5173,https://antikdetstvo.ru,https://www.antikdetstvo.ru";
+const ALLOWED_ORIGIN_LIST = (ALLOWED_ORIGINS === "*" ? "*" : ALLOWED_ORIGINS || DEFAULT_ORIGINS)
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_API_SECRET) {
+    console.warn("ADMIN_API_SECRET is not set — protected route blocked");
+    return res.status(503).json({ error: "Admin API not configured" });
+  }
+  const header = req.headers["x-admin-secret"];
+  if (header !== ADMIN_API_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+function clientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string") {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress ?? "unknown";
+}
+
+const subscribeHits = new Map();
+
+function checkSubscribeRateLimit(ip) {
+  const windowMs = 15 * 60 * 1000;
+  const maxHits = 5;
+  const now = Date.now();
+  const entry = subscribeHits.get(ip) ?? { count: 0, resetAt: now + windowMs };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + windowMs;
+  }
+  entry.count += 1;
+  subscribeHits.set(ip, entry);
+  return entry.count <= maxHits;
+}
+
+const ALLOWED_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+]);
+
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error("Допустимы только JPEG, PNG, WebP и GIF"));
+  },
+});
+
+function getSupabaseAdmin() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+}
 
 if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
   console.warn("⚠️  YOOKASSA_SHOP_ID or YOOKASSA_SECRET_KEY is not set. Requests will fail until you configure them.");
@@ -32,11 +106,13 @@ if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || ALLOWED_ORIGINS === "*") {
+    if (ALLOWED_ORIGIN_LIST.includes("*")) {
       return callback(null, true);
     }
-    const allowed = ALLOWED_ORIGINS.split(",").map((value) => value.trim());
-    if (allowed.includes(origin)) {
+    if (!origin) {
+      return callback(null, true);
+    }
+    if (ALLOWED_ORIGIN_LIST.includes(origin)) {
       return callback(null, true);
     }
     return callback(new Error("Not allowed by CORS"));
@@ -45,7 +121,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const requiredFields = ["fullName", "phone", "totalPrice", "items"];
 
@@ -327,6 +403,59 @@ async function sendTelegramToChat(chatId, text) {
   }
 }
 
+async function resolveOrderItemsFromDb(cartItems) {
+  if (!sql) {
+    throw new Error("Database not configured");
+  }
+
+  const normalizedItems = [];
+  let serverTotal = 0;
+
+  for (let index = 0; index < cartItems.length; index += 1) {
+    const item = cartItems[index];
+    const product = item.product ?? {};
+    const productId = String(product.id ?? "").trim();
+    if (!productId) {
+      throw new Error(`Missing product id for item ${index + 1}`);
+    }
+
+    const quantity = Math.max(1, Math.min(99, Number(item.quantity) || 1));
+    const rows = await sql`
+      SELECT id, title, price, in_stock
+      FROM products
+      WHERE id = ${productId}
+    `;
+    const row = rows[0];
+    if (!row) {
+      throw new Error(`Product not found: ${productId}`);
+    }
+
+    const unitPrice = Number(row.price);
+    if (Number.isNaN(unitPrice) || unitPrice <= 0) {
+      throw new Error(`Invalid price for product: ${productId}`);
+    }
+
+    const materialRaw = item.materialChoice ?? null;
+    const material =
+      materialRaw === "glass"
+        ? "glass"
+        : materialRaw === "unbreakable"
+        ? "unbreakable"
+        : null;
+
+    serverTotal += unitPrice * quantity;
+    normalizedItems.push({
+      id: row.id,
+      title: row.title,
+      quantity,
+      price: unitPrice,
+      material,
+    });
+  }
+
+  return { normalizedItems, serverTotal };
+}
+
 app.post("/create-payment", async (req, res) => {
   try {
     if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
@@ -345,30 +474,28 @@ app.post("/create-payment", async (req, res) => {
       return res.status(400).json({ error: "Order must contain items" });
     }
 
-    const totalPrice = Number(body.totalPrice);
-    if (Number.isNaN(totalPrice) || totalPrice <= 0) {
+    const clientTotal = Number(body.totalPrice);
+    if (Number.isNaN(clientTotal) || clientTotal <= 0) {
       return res.status(400).json({ error: "Invalid totalPrice" });
     }
 
-    const normalizedItems = body.items.map((item, index) => {
-      const product = item.product ?? {};
-      const quantity = Number(item.quantity) || 1;
-      const unitPrice = Number(product.price) || 0;
-      const materialRaw = item.materialChoice ?? null;
-      const material =
-        materialRaw === "glass"
-          ? "glass"
-          : materialRaw === "unbreakable"
-          ? "unbreakable"
-          : null;
-      return {
-        id: product.id ?? `item-${index + 1}`,
-        title: product.title ?? `Товар ${index + 1}`,
-        quantity,
-        price: unitPrice,
-        material,
-      };
-    });
+    let normalizedItems;
+    let totalPrice;
+    try {
+      const resolved = await resolveOrderItemsFromDb(body.items);
+      normalizedItems = resolved.normalizedItems;
+      totalPrice = resolved.serverTotal;
+    } catch (resolveErr) {
+      console.error("Order resolve error:", resolveErr);
+      return res.status(400).json({
+        error: resolveErr.message || "Could not validate order items",
+      });
+    }
+
+    if (Math.abs(totalPrice - clientTotal) > 0.02) {
+      console.warn("Price mismatch", { clientTotal, serverTotal: totalPrice });
+      return res.status(400).json({ error: "Order total does not match catalog prices" });
+    }
 
     const idempotenceKey = crypto.randomUUID();
     const auth = Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString("base64");
@@ -445,6 +572,82 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+const contactHits = new Map();
+
+function checkContactRateLimit(ip) {
+  const windowMs = 60 * 60 * 1000;
+  const maxHits = 10;
+  const now = Date.now();
+  const entry = contactHits.get(ip) ?? { count: 0, resetAt: now + windowMs };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + windowMs;
+  }
+  entry.count += 1;
+  contactHits.set(ip, entry);
+  return entry.count <= maxHits;
+}
+
+app.post("/api/contact", async (req, res) => {
+  const ip = clientIp(req);
+  if (!checkContactRateLimit(ip)) {
+    return res.status(429).json({ error: "Too many requests. Try again later." });
+  }
+
+  try {
+    const name = String(req.body?.name ?? "").trim();
+    const email = normalizeEmail(req.body?.email);
+    const phone = req.body?.phone ? String(req.body.phone).trim() : "";
+    const message = String(req.body?.message ?? "").trim();
+
+    if (!name || name.length < 2) {
+      return res.status(400).json({ error: "Invalid name" });
+    }
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email" });
+    }
+    if (!message || message.length < 5) {
+      return res.status(400).json({ error: "Invalid message" });
+    }
+
+    const text = [
+      "Новое сообщение с формы контактов",
+      "",
+      `Имя: ${name}`,
+      `Email: ${email}`,
+      phone ? `Телефон: ${phone}` : null,
+      "",
+      message,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }),
+      });
+    } else if (mailer) {
+      await mailer.sendMail({
+        from: SMTP_FROM,
+        to: SMTP_FROM,
+        replyTo: email,
+        subject: `Контакты: ${name}`,
+        text,
+      });
+    } else {
+      console.warn("Contact form: no Telegram or SMTP configured");
+      return res.status(503).json({ error: "Contact delivery is not configured" });
+    }
+
+    return res.json({ ok: true, message: "Спасибо! Мы свяжемся с вами в ближайшее время." });
+  } catch (err) {
+    console.error("Contact form error:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // Webhook для Telegram-бота: команда /start связывает username с chat_id
 app.post("/telegram-bot-webhook", async (req, res) => {
   try {
@@ -482,7 +685,7 @@ app.post("/telegram-bot-webhook", async (req, res) => {
 });
 
 // --- API товаров (Neon) для каталога и админки ---
-app.get("/api/product-watch/list", async (_req, res) => {
+app.get("/api/product-watch/list", requireAdmin, async (_req, res) => {
   if (!sql) {
     return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
   }
@@ -522,6 +725,11 @@ app.get("/api/product-watch/list", async (_req, res) => {
 app.post("/api/product-watch/subscribe", async (req, res) => {
   if (!sql) {
     return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
+  }
+
+  const ip = clientIp(req);
+  if (!checkSubscribeRateLimit(ip)) {
+    return res.status(429).json({ error: "Too many requests. Try again later." });
   }
 
   try {
@@ -583,7 +791,7 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
       console.warn("SUBSCRIBE_CONFIRM_URL or SUBSCRIBE_CONFIRM_SECRET is not set, skip subscribe confirmation email");
     }
 
-    return res.json({ ok: true, subscription });
+    return res.json({ ok: true });
   } catch (err) {
     console.error("Subscribe error:", err);
     return res.status(500).json({ error: err.message || "Internal error" });
@@ -591,7 +799,7 @@ app.post("/api/product-watch/subscribe", async (req, res) => {
 });
 
 // Рассылка в Telegram всем chat_id, привязанным к подпискам по товару
-app.post("/api/product-watch/notify-telegram", async (req, res) => {
+app.post("/api/product-watch/notify-telegram", requireAdmin, async (req, res) => {
   if (!sql) {
     return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
   }
@@ -675,6 +883,44 @@ app.get("/api/product-watch/unsubscribe/:token", async (req, res) => {
   }
 });
 
+app.post("/api/upload", requireAdmin, imageUpload.single("file"), async (req, res) => {
+
+  const supabase = getSupabaseAdmin();
+  if (!supabase) {
+    return res.status(503).json({
+      error: "Storage not configured (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)",
+    });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ error: "Файл не передан" });
+  }
+
+  try {
+    const subtype = req.file.mimetype.split("/")[1] ?? "jpg";
+    const ext = subtype === "jpeg" ? "jpg" : subtype;
+    const fileName = `products/${crypto.randomUUID()}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from(PRODUCT_IMAGES_BUCKET)
+      .upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false,
+      });
+
+    if (uploadError) {
+      console.error("Supabase upload error:", uploadError);
+      return res.status(500).json({ error: uploadError.message || "Upload failed" });
+    }
+
+    const { data } = supabase.storage.from(PRODUCT_IMAGES_BUCKET).getPublicUrl(fileName);
+    return res.json({ url: data.publicUrl });
+  } catch (err) {
+    console.error("Upload error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+
 app.get("/api/products", async (_req, res) => {
   if (!sql) {
     return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
@@ -693,7 +939,7 @@ app.get("/api/products", async (_req, res) => {
   }
 });
 
-app.post("/api/products", async (req, res) => {
+app.post("/api/products", requireAdmin, async (req, res) => {
   if (!sql) {
     return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
   }
@@ -734,7 +980,7 @@ app.get("/api/products/:id", async (req, res) => {
   }
 });
 
-app.patch("/api/products/:id", async (req, res) => {
+app.patch("/api/products/:id", requireAdmin, async (req, res) => {
   if (!sql) {
     return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
   }
@@ -790,7 +1036,7 @@ app.patch("/api/products/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/products/:id", async (req, res) => {
+app.delete("/api/products/:id", requireAdmin, async (req, res) => {
   if (!sql) {
     return res.status(503).json({ error: "Database not configured (DATABASE_URL)" });
   }
@@ -824,6 +1070,19 @@ app.post("/yookassa-webhook", async (req, res) => {
   }
 
   res.json({ ok: true });
+});
+
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({ error: "Файл слишком большой (макс. 5 МБ)" });
+    }
+    return res.status(400).json({ error: err.message });
+  }
+  if (err?.message && req.path === "/api/upload") {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
